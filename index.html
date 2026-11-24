@@ -277,6 +277,46 @@ const CORE_BASE = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd/';
 const WORKER_SRC = `
 let core = null, logs = [];
 const post = (m, t) => self.postMessage(m, t || []);
+// Big files (the finished video, the converted picture) are kept on the device's storage (the browser's private
+// file area) instead of in memory: phones close a tab that holds a few hundred MB, which looks like the page reloading.
+let dir = null, diskOK = null, diskSeq = 0;
+const disk = new Map();                                        // path in FFmpeg's file system -> { fh, h, name, node }
+async function diskClose(path, remove) {
+  const d = disk.get(path); if (!d) return;
+  disk.delete(path);
+  try { await d.h.close(); } catch (e) {}
+  try { core.FS.unlink(path); } catch (e) {}
+  if (remove) try { await dir.removeEntry(d.name); } catch (e) {}
+}
+async function diskFile(path) {
+  await diskClose(path, true);
+  const name = 'f' + (++diskSeq) + '-' + Date.now();
+  const fh = await dir.getFileHandle(name, { create: true });
+  const h = await fh.createSyncAccessHandle();
+  const FS = core.FS;
+  try { FS.unlink(path); } catch (e) {}
+  FS.writeFile(path, new Uint8Array(0));
+  const node = FS.lookupPath(path).node, baseNode = node.node_ops, baseStream = node.stream_ops;
+  node.contents = null; node.usedBytes = 0;                    // usedBytes = the file's logical size
+  node.node_ops = Object.assign({}, baseNode, { setattr(n, a) {
+    if (a.size !== undefined) { n.usedBytes = a.size; a = Object.assign({}, a); delete a.size; }   // truncate: stale bytes past the size are never read
+    baseNode.setattr(n, a);
+  } });
+  node.stream_ops = {
+    llseek: baseStream.llseek,
+    read(s, buf, off, len, pos) {
+      const n = s.node; if (pos >= n.usedBytes) return 0;
+      return h.read(buf.subarray(off, off + Math.min(len, n.usedBytes - pos)), { at: pos });
+    },
+    write(s, buf, off, len, pos) {
+      if (!len) return 0;
+      let w; try { w = h.write(buf.subarray(off, off + len), { at: pos }); } catch (e) { throw new FS.ErrnoError(51); }   // ENOSPC
+      const n = s.node; n.usedBytes = Math.max(n.usedBytes, pos + w); n.timestamp = Date.now();
+      return w;
+    },
+  };
+  disk.set(path, { fh, h, name, node });
+}
 self.onmessage = async ({ data: { id, cmd, args } }) => {
   try {
     let result = null;
@@ -303,6 +343,42 @@ self.onmessage = async ({ data: { id, cmd, args } }) => {
       if (core.setTimeout) core.setTimeout(-1);
       try { core.exec(...args.argv); result = { ret: core.ret, log: logs.join('\\n') }; }
       finally { try { core.reset(); } catch (e) {} }
+    } else if (cmd === 'diskInit') {
+      // Can this browser keep files on storage? Also clears everything left from earlier runs.
+      for (const p of [...disk.keys()]) await diskClose(p, true);
+      if (diskOK === null) {
+        try {
+          dir = await (await navigator.storage.getDirectory()).getDirectoryHandle('audio-polish', { create: true });
+          const h = await (await dir.getFileHandle('probe', { create: true })).createSyncAccessHandle();
+          h.write(new Uint8Array([1]), { at: 0 }); await h.close();
+          diskOK = true;
+        } catch (e) { diskOK = false; }
+      }
+      if (diskOK) {
+        const names = []; try { for await (const n of dir.keys()) names.push(n); } catch (e) {}
+        for (const n of names) try { await dir.removeEntry(n); } catch (e) {}
+      }
+      result = diskOK;
+    } else if (cmd === 'diskFile') {
+      await diskFile(args.path);
+    } else if (cmd === 'diskWrite') {
+      const d = disk.get(args.path), data = new Uint8Array(args.data);
+      let done = 0;
+      while (done < data.length) {
+        const w = d.h.write(data.subarray(done), { at: args.position + done });
+        if (!w) throw new Error('Could not write to storage.');
+        done += w;
+      }
+      d.node.usedBytes = Math.max(d.node.usedBytes, args.position + done);
+    } else if (cmd === 'diskTake') {
+      // Finish a stored file and hand it to the page as a File that stays on storage (no copy in memory).
+      const d = disk.get(args.path), size = d.node.usedBytes;
+      await d.h.truncate(size); await d.h.flush(); await d.h.close();
+      disk.delete(args.path);
+      try { core.FS.unlink(args.path); } catch (e) {}
+      const f = await d.fh.getFile();
+      post({ id, ok: true, result: f.slice(0, size, args.type || '') });
+      return;
     } else if (cmd === 'readBlob') {
       // hand the result over as a Blob: one copy out of the engine's memory, none on the page side
       const node = core.FS.lookupPath(args.path).node;
@@ -319,7 +395,8 @@ self.onmessage = async ({ data: { id, cmd, args } }) => {
     } else if (cmd === 'write') {
       core.FS.writeFile(args.path, new Uint8Array(args.data));
     } else if (cmd === 'rm') {
-      try { core.FS.unlink(args.path); } catch (e) {}
+      if (disk.has(args.path)) await diskClose(args.path, true);
+      else try { core.FS.unlink(args.path); } catch (e) {}
     }
     post({ id, ok: true, result });
   } catch (err) {
@@ -502,7 +579,7 @@ let mbPromise = null;
 const loadMediabunny = () => mbPromise || (mbPromise = import(MB_URL).catch(e => { mbPromise = null; throw e; }));
 
 // Returns null when the video is already 1080p or smaller. Frame rate and timing are kept exactly as recorded.
-async function downscaleVideo(file, onProgress) {
+async function downscaleVideo(file, onProgress, toDisk) {
   const MB = await loadMediabunny();
   const input = new MB.Input({ formats: MB.ALL_FORMATS, source: new MB.BlobSource(file) });
   const vt = await input.getPrimaryVideoTrack();
@@ -514,8 +591,17 @@ async function downscaleVideo(file, onProgress) {
   // Bitrate well above what Instagram/TikTok deliver, so their re-encode starts from a clean file.
   const fps = await vt.computePacketStats(120).then(s => s.averagePacketRate).catch(() => 30);
   const bitrate = fps > 40 ? 16e6 : 12e6;
-  const target = new MB.BufferTarget();
-  const output = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart: 'in-memory' }), target });
+  // Straight to storage in 4 MB pieces when possible; otherwise the whole converted video is built in memory.
+  let target, fastStart = 'in-memory';
+  if (toDisk) {
+    await engine.call('diskFile', { path: '/v1080.mp4' });
+    target = new MB.StreamTarget(new WritableStream({ write: c => {
+      const d = c.data.slice();                                // own copy: the original buffer may be reused
+      return engine.call('diskWrite', { path: '/v1080.mp4', data: d.buffer, position: c.position }, [d.buffer]);
+    } }), { chunked: true, chunkSize: 4 * 1048576 });
+    fastStart = false;                                         // only an intermediate file; the final file gets Fast Start from FFmpeg
+  } else target = new MB.BufferTarget();
+  const output = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart }), target });
   const conv = await MB.Conversion.init({
     input, output,
     trim: { start: 0 },                                       // keep original timestamps, so audio from the original stays in sync
@@ -526,7 +612,7 @@ async function downscaleVideo(file, onProgress) {
     conv.discardedTracks.map(d => d.reason).join(', ') + '). Turn off "Convert to Full HD" and try again.');
   conv.onProgress = p => onProgress(p);
   await conv.execute();
-  return { buffer: target.buffer, from: [w, h], to };
+  return { buffer: toDisk ? null : target.buffer, from: [w, h], to };
 }
 // Is this video HDR (the iPhone default)? Converting HDR to standard H.264 can shift colours.
 async function isHDR(file) {
@@ -538,11 +624,17 @@ async function isHDR(file) {
 }
 
 /* ---------------- Pipeline ---------------- */
+// Temporary files from an earlier visit (e.g. if the tab was closed mid-run) are removed when the page opens.
+const leftoversCleared = (async () => {
+  try { await (await navigator.storage.getDirectory()).removeEntry('audio-polish', { recursive: true }); } catch (e) {}
+})();
 async function polish(file, opts, ui = {}) {
   const step = ui.step || (() => {}), prog = ui.progress || (() => {});
   const target = opts.target;
   step('load');
   await engine.load();
+  await leftoversCleared;
+  const toDisk = await engine.call('diskInit').catch(() => false);
   const inPath = await engine.call('mount', { file });
   try {
     step('probe');
@@ -557,12 +649,14 @@ async function polish(file, opts, ui = {}) {
     if (opts.downscale && info.hasVideo && canConvertVideo) {
       step('video'); vShare = 0.6;
       try {
-        picture = await downscaleVideo(file, p => prog(0.6 * clamp(p, 0, 1)));
-        if (picture) await engine.call('write', { path: '/v1080.mp4', data: picture.buffer }, [picture.buffer]);
+        picture = await downscaleVideo(file, p => prog(0.6 * clamp(p, 0, 1)), toDisk);
+        if (picture && picture.buffer) await engine.call('write', { path: '/v1080.mp4', data: picture.buffer }, [picture.buffer]);
+        if (!picture) await engine.call('rm', { path: '/v1080.mp4' });
       } catch (e) {
         console.warn('Picture conversion failed; keeping the original picture.', e);
         if (!engine.worker) throw e;                          // the engine itself died; nothing sensible to continue with
         picture = null;
+        await engine.call('rm', { path: '/v1080.mp4' });
         pictureNote = "The picture couldn't be converted on this device, so it was kept at its original size.";
       }
     }
@@ -610,6 +704,7 @@ async function polish(file, opts, ui = {}) {
     const vin = picture ? ['-i', '/v1080.mp4', '-i', inPath, '-map', '0:v:0', '-map', info.audioMap.replace(/^0:/, '1:'), '-map_metadata', '1']
                         : ['-i', inPath, '-map', '0:v:0', '-map', info.audioMap, '-map_metadata', '0'];
     const outPath = '/out.' + outExt;
+    if (toDisk) await engine.call('diskFile', { path: outPath });
     const render = async (gain, ceiling, quiet) => {
       if (quiet) engine.onProgress = null; else track(0.4, 0.4);
       const af = cleanup + ',' + finishChain(gain, ceiling);
@@ -620,7 +715,9 @@ async function polish(file, opts, ui = {}) {
           ? ['-i', inPath, '-map', info.audioMap, '-af', af, '-c:a', 'pcm_s24le', '-ar', '48000', ...STRIP_LOCATION, outPath]
           : ['-i', inPath, '-map', info.audioMap, '-af', af, '-c:a', 'aac', '-b:a', '320k', '-ar', '48000', ...STRIP_LOCATION, '-movflags', '+faststart', outPath];
       const r = await engine.exec(argv);
-      if (r.ret !== 0) throw new Error('Rendering failed (FFmpeg error).\n' + r.log.split('\n').slice(-6).join('\n'));
+      if (r.ret !== 0) throw new Error(/No space left/i.test(r.log)
+        ? "There isn't enough free storage on this device for the finished file. Free up some space and try again."
+        : 'Rendering failed (FFmpeg error).\n' + r.log.split('\n').slice(-6).join('\n'));
     };
 
     // Gain and limiter plan. The ceiling sits 1 dB under the target for AAC (the encoder adds overshoot) and is
@@ -658,7 +755,7 @@ async function polish(file, opts, ui = {}) {
     if (staging + gain > 20 && opts.style !== 'none' && !opts.denoise)
       notes.push('Your recording was very quiet, so its background noise was raised too. If you hear hiss or hum, run it again with "Reduce background noise and rumble" on.');
     const mime = outExt === 'wav' ? 'audio/wav' : outExt === 'mov' ? 'video/quicktime' : info.hasVideo ? 'video/mp4' : 'audio/mp4';
-    const blob = await engine.call('readBlob', { path: outPath, type: mime });
+    const blob = await engine.call(toDisk ? 'diskTake' : 'readBlob', { path: outPath, type: mime });
     return { blob, outExt, before, after, hasVideo: info.hasVideo, short: target.I - after.I > 0.5,
              picture: picture && { from: picture.from, to: picture.to }, notes };
   } finally {
